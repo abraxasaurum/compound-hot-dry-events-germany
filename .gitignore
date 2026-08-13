@@ -1,0 +1,18 @@
+# Local data downloads and generated analysis products
+data/raw/
+data/processed/
+data/outputs/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+.vscode/
