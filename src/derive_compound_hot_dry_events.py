@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
-"""Derive compound hot–dry events from prepared regional DWD daily data.
+"""Derive compound hot-dry events from regional DWD or E-OBS daily data.
 
 Primary definition
 ------------------
-Warm season: April–September
+Warm season: April-September
 Heat: TXK >= calendar-day-specific 90th percentile
 Dry condition: antecedent 30-day RSK sum <= calendar-day-specific 10th percentile
 Event: >= 3 consecutive compound days
-Baseline for thresholds: 1961–1990 (fixed)
+Baseline for thresholds: 1961-1990 (fixed)
 
 The calendar-day thresholds use a +/- 15-day window in the baseline period.
 No missing values are imputed. The p20 dry threshold is also calculated and
 can be used as an optional sensitivity analysis.
 
-Run primary analysis:
-    python src/derive_compound_hot_dry_events.py
+Run DWD primary analysis:
+    python src/derive_compound_hot_dry_events.py --dataset dwd
 
-Run primary and p20 dry-threshold sensitivity analysis:
-    python src/derive_compound_hot_dry_events.py --run-sensitivity
-
-Example with a different minimum duration:
-    python src/derive_compound_hot_dry_events.py --event-min-days 6
+Run E-OBS primary and p20 sensitivity analysis:
+    python src/derive_compound_hot_dry_events.py --dataset eobs --run-sensitivity
 """
 from __future__ import annotations
 
@@ -31,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-INPUT_PATH = Path("data/processed/analysis_region_daily_1961_2025.parquet")
+
 PROCESSED_DIR = Path("data/processed")
 OUTPUT_DIR = Path("data/outputs")
 WARM_MONTHS = {4, 5, 6, 7, 8, 9}
@@ -42,9 +39,34 @@ WINDOW_DAYS = 15
 HEAT_PERCENTILE = 0.90
 DRY_PERCENTILES = (0.10, 0.20)
 
+DATASETS = {
+    "dwd": {
+        "input_path": PROCESSED_DIR / "analysis_region_daily_1961_2025.parquet",
+        "daily_output": PROCESSED_DIR / "compound_hot_dry_daily_1961_2025.parquet",
+        "output_prefix": "compound_hot_dry",
+        "start_year": 1961,
+        "end_year": 2025,
+        "label": "DWD two-station regional index",
+    },
+    "eobs": {
+        "input_path": PROCESSED_DIR / "eobs_region_daily_1961_2024.parquet",
+        "daily_output": PROCESSED_DIR / "eobs_compound_hot_dry_daily_1961_2024.parquet",
+        "output_prefix": "eobs_compound_hot_dry",
+        "start_year": 1961,
+        "end_year": 2024,
+        "label": "E-OBS two-cell regional index",
+    },
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Derive compound hot-dry events.")
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASETS),
+        default="dwd",
+        help="Regional input dataset to analyse (default: dwd).",
+    )
     parser.add_argument("--baseline-start", type=int, default=DEFAULT_BASELINE_START)
     parser.add_argument("--baseline-end", type=int, default=DEFAULT_BASELINE_END)
     parser.add_argument("--event-min-days", type=int, default=DEFAULT_EVENT_MIN_DAYS)
@@ -57,15 +79,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def climatology_day(dates: pd.Series) -> pd.Series:
-    return pd.to_datetime(
-    "2000-" + dates.dt.strftime("%m-%d"),
-    format="%Y-%m-%d",
-    )
+    return pd.to_datetime("2000-" + dates.dt.strftime("%m-%d"), format="%Y-%m-%d")
 
 
 def threshold_table(region_data: pd.DataFrame, baseline_start: int, baseline_end: int) -> pd.DataFrame:
     baseline = region_data.loc[
-        (region_data["MESS_DATUM"].dt.year.between(baseline_start, baseline_end))
+        region_data["MESS_DATUM"].dt.year.between(baseline_start, baseline_end)
         & region_data["region_complete"]
     ].copy()
     baseline["clim_date"] = climatology_day(baseline["MESS_DATUM"])
@@ -92,52 +111,22 @@ def threshold_table(region_data: pd.DataFrame, baseline_start: int, baseline_end
 def label_events(data: pd.DataFrame, condition_column: str, min_days: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     frame = data.copy()
     condition = frame[condition_column].fillna(False)
-
-    previous_condition = (
-        condition.groupby(frame["region"])
-        .shift()
-        .fillna(False)
-    )
-
-    run_id = (
-        condition.ne(previous_condition)
-        .groupby(frame["region"])
-        .cumsum()
-    )
-
-    run_length = condition.groupby(
-        [frame["region"], run_id]
-    ).transform("sum")
+    previous_condition = condition.groupby(frame["region"]).shift().fillna(False)
+    run_id = condition.ne(previous_condition).groupby(frame["region"]).cumsum()
+    run_length = condition.groupby([frame["region"], run_id]).transform("sum")
 
     frame["is_event_day"] = condition & (run_length >= min_days)
-
-    frame["event_run_id"] = run_id.where(
-        frame["is_event_day"],
-        pd.NA,
-    )
+    frame["event_run_id"] = run_id.where(frame["is_event_day"], pd.NA)
 
     event_lookup = (
-        frame.loc[
-            frame["is_event_day"],
-            ["region", "event_run_id"],
-        ]
+        frame.loc[frame["is_event_day"], ["region", "event_run_id"]]
         .drop_duplicates()
         .sort_values(["region", "event_run_id"])
         .reset_index(drop=True)
     )
+    event_lookup["event_id"] = event_lookup.groupby("region").cumcount().add(1)
 
-    event_lookup["event_id"] = (
-        event_lookup.groupby("region")
-        .cumcount()
-        .add(1)
-    )
-
-    frame = frame.merge(
-        event_lookup,
-        on=["region", "event_run_id"],
-        how="left",
-    )
-
+    frame = frame.merge(event_lookup, on=["region", "event_run_id"], how="left")
     frame["event_id"] = frame["event_id"].astype("Int64")
 
     events = (
@@ -163,8 +152,8 @@ def label_events(data: pd.DataFrame, condition_column: str, min_days: int) -> tu
     return frame, events
 
 
-def annual_summary(events: pd.DataFrame, regions: list[str]) -> pd.DataFrame:
-    years = pd.DataFrame({"year": np.arange(1961, 2026)})
+def annual_summary(events: pd.DataFrame, regions: list[str], start_year: int, end_year: int) -> pd.DataFrame:
+    years = pd.DataFrame({"year": np.arange(start_year, end_year + 1)})
     all_groups = pd.MultiIndex.from_product([regions, years["year"]], names=["region", "year"]).to_frame(index=False)
     if events.empty:
         result = all_groups.copy()
@@ -187,7 +176,13 @@ def annual_summary(events: pd.DataFrame, regions: list[str]) -> pd.DataFrame:
     return result
 
 
-def run_definition(data: pd.DataFrame, dry_percentile: int, min_days: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_definition(
+    data: pd.DataFrame,
+    dry_percentile: int,
+    min_days: int,
+    start_year: int,
+    end_year: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     threshold_column = f"precip_30d_p{dry_percentile}"
     condition_column = f"compound_p{dry_percentile}"
     frame = data.copy()
@@ -200,21 +195,27 @@ def run_definition(data: pd.DataFrame, dry_percentile: int, min_days: int) -> tu
     frame["precip_deficit"] = frame[threshold_column] - frame["precip_30d"]
 
     labelled, events = label_events(frame, condition_column, min_days)
-    annual = annual_summary(events, sorted(frame["region"].unique()))
+    annual = annual_summary(events, sorted(frame["region"].unique()), start_year, end_year)
     return labelled, events, annual
 
 
 def main() -> None:
     args = parse_args()
+    settings = DATASETS[args.dataset]
     if args.baseline_end < args.baseline_start:
         raise ValueError("baseline-end must be >= baseline-start")
     if args.event_min_days < 1:
         raise ValueError("event-min-days must be at least 1")
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"Missing {INPUT_PATH}. Run prepare_analysis_data.py first.")
+    if not settings["input_path"].exists():
+        raise FileNotFoundError(f"Missing {settings['input_path']}.")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    data = pd.read_parquet(INPUT_PATH)
+    data = pd.read_parquet(settings["input_path"])
+    required = {"region", "MESS_DATUM", "TXK", "RSK", "region_complete"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"Input is missing required columns: {sorted(missing)}")
+
     data["MESS_DATUM"] = pd.to_datetime(data["MESS_DATUM"])
     data = data.sort_values(["region", "MESS_DATUM"]).reset_index(drop=True)
     data["is_warm_season"] = data["MESS_DATUM"].dt.month.isin(WARM_MONTHS)
@@ -229,7 +230,7 @@ def main() -> None:
         thresholds.insert(0, "region", region)
         threshold_frames.append(thresholds)
     thresholds = pd.concat(threshold_frames, ignore_index=True)
-    thresholds.to_csv(OUTPUT_DIR / "compound_hot_dry_thresholds.csv", index=False)
+    thresholds.to_csv(OUTPUT_DIR / f"{settings['output_prefix']}_thresholds.csv", index=False)
 
     data = data.merge(thresholds, on=["region", "calendar_day"], how="left")
     data.loc[~data["is_warm_season"], ["heat_txk_p90", "precip_30d_p10", "precip_30d_p20"]] = np.nan
@@ -237,17 +238,33 @@ def main() -> None:
     definitions = [10, 20] if args.run_sensitivity else [10]
     primary_daily = None
     for dry_percentile in definitions:
-        daily, events, annual = run_definition(data, dry_percentile, args.event_min_days)
-        events.to_csv(OUTPUT_DIR / f"compound_hot_dry_events_p{dry_percentile}.csv", index=False)
-        annual.to_csv(OUTPUT_DIR / f"compound_hot_dry_annual_p{dry_percentile}.csv", index=False)
+        daily, events, annual = run_definition(
+            data,
+            dry_percentile,
+            args.event_min_days,
+            settings["start_year"],
+            settings["end_year"],
+        )
+        events.to_csv(
+            OUTPUT_DIR / f"{settings['output_prefix']}_events_p{dry_percentile}.csv",
+            index=False,
+        )
+        annual.to_csv(
+            OUTPUT_DIR / f"{settings['output_prefix']}_annual_p{dry_percentile}.csv",
+            index=False,
+        )
         if dry_percentile == 10:
             primary_daily = daily
 
-    primary_path = PROCESSED_DIR / "compound_hot_dry_daily_1961_2025.parquet"
-    primary_daily.to_parquet(primary_path, index=False)
+    primary_daily.to_parquet(settings["daily_output"], index=False)
 
     config = {
-        "analysis_period": "1961-01-01 to 2025-12-31",
+        "dataset": args.dataset,
+        "dataset_label": settings["label"],
+        "input_path": str(settings["input_path"]),
+        "analysis_period": (
+            f"{settings['start_year']}-01-01 to {settings['end_year']}-12-31"
+        ),
         "warm_season": "April to September",
         "baseline_period": f"{args.baseline_start}-01-01 to {args.baseline_end}-12-31",
         "calendar_window_days": WINDOW_DAYS,
@@ -257,10 +274,13 @@ def main() -> None:
         "sensitivity_dry_threshold_p20_created": args.run_sensitivity,
         "missing_data_policy": "No imputation; incomplete regional days cannot be compound days.",
     }
-    (OUTPUT_DIR / "compound_hot_dry_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (OUTPUT_DIR / f"{settings['output_prefix']}_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
 
-    primary_events = pd.read_csv(OUTPUT_DIR / "compound_hot_dry_events_p10.csv")
-    print(f"Wrote {primary_path}")
+    primary_events = pd.read_csv(OUTPUT_DIR / f"{settings['output_prefix']}_events_p10.csv")
+    print(f"Dataset: {settings['label']}")
+    print(f"Wrote {settings['daily_output']}")
     print("Wrote thresholds, events, annual summaries and configuration to data/outputs/")
     print("\nPrimary p10 event counts:")
     if primary_events.empty:
