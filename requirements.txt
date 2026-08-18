@@ -7,3 +7,5 @@ matplotlib
 seaborn
 jupyterlab
 ipykernel
+xarray
+netCDF4
